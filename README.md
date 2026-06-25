@@ -51,10 +51,10 @@ Tagging is the foundation of cloud governance — cost allocation, security scop
 ## Quick Start
 
 ```bash
-git clone https://github.com/aws-samples/sample-tagsense-tag-remediation.git
-cd tagsense
+git clone https://github.com/aws-samples/sample-genai-tag-debt-remediation.git
+cd sample-genai-tag-debt-remediation
 sam build
-sam deploy --guided
+sam deploy --guided --capabilities CAPABILITY_NAMED_IAM
 ```
 
 SAM handles everything — packages Lambda code, uploads to S3, deploys CloudFormation. No manual zipping or shell scripts.
@@ -76,13 +76,41 @@ Without this file, Tier 4 AI inference still works but suggests freeform values.
 ### Run First Scan
 
 ```bash
-aws stepfunctions start-execution \
+# Start scan and capture execution ARN
+EXEC_ARN=$(aws stepfunctions start-execution \
   --state-machine-arn $(aws cloudformation describe-stacks --stack-name tagsense \
     --query "Stacks[0].Outputs[?OutputKey=='StateMachineArn'].OutputValue" --output text) \
-  --input '{"region": "us-east-1"}'
+  --input '{"region": "us-east-1"}' \
+  --query "executionArn" --output text)
+echo "Started: $EXEC_ARN"
+
+# Check status (re-run until SUCCEEDED)
+aws stepfunctions describe-execution --execution-arn $EXEC_ARN --query "status" --output text
 ```
 
-Monitor in the Step Functions console. Typical runtime: 5-10 minutes for ~2,000 resources.
+Status will be `RUNNING` → `SUCCEEDED`. Typical runtime: 5-10 minutes for ~2,000 resources.
+
+### Download Results
+
+Once status is `SUCCEEDED`:
+
+```bash
+# Set your bucket name
+BUCKET=tagsense-results-$(aws sts get-caller-identity --query Account --output text)
+
+# Get latest run ID (timestamp format: YYYYMMDD-HHMMSS)
+RUN_ID=$(aws s3 ls s3://$BUCKET/tagsense/ --region us-east-1 | awk '{print $2}' | grep '^[0-9]' | tr -d '/' | sort | tail -1)
+echo "Latest run: $RUN_ID"
+
+# View summary in terminal
+aws s3 cp s3://$BUCKET/tagsense/$RUN_ID/summary.txt - --region us-east-1
+
+# Download HTML report
+aws s3 cp s3://$BUCKET/tagsense/$RUN_ID/report.html ./report.html
+
+# Download review CSV
+aws s3 cp s3://$BUCKET/tagsense/$RUN_ID/review.csv ./review.csv
+```
 
 ### Parameters
 
@@ -211,24 +239,47 @@ Tier 4 confidence is **LLM-self-reported**: the prompt asks Claude to rate each 
 
 Generates a CSV with an `Approve (Y/N)` column for human review. No tags applied without explicit approval.
 
-### Apply (manual trigger, dry-run default)
+### Apply Approved Tags
+
+After reviewing the CSV and marking `Y` in the Approve column:
 
 ```bash
-# Dry run
-aws lambda invoke --function-name tagsense-apply \
-  --payload '{"run_id": "<run_id>", "dry_run": true}' response.json
+# 1. Upload your approved CSV back to S3
+aws s3 cp ./review.csv s3://$BUCKET/tagsense/$RUN_ID/review.csv --region us-east-1
 
-# Apply approved tags
+# 2. Dry run (preview what would be applied — no changes made)
 aws lambda invoke --function-name tagsense-apply \
-  --payload '{"run_id": "<run_id>", "dry_run": false}' response.json
+  --cli-binary-format raw-in-base64-out \
+  --payload "{\"run_id\": \"$RUN_ID\", \"dry_run\": true}" response.json
+cat response.json
+
+# 3. Apply for real (only after verifying dry-run output)
+aws lambda invoke --function-name tagsense-apply \
+  --cli-binary-format raw-in-base64-out \
+  --payload "{\"run_id\": \"$RUN_ID\", \"dry_run\": false}" response.json
+cat response.json
 ```
 
-### Enforce
+The Apply Lambda only tags resources where `Approve (Y/N)` = `Y` in the uploaded CSV. A 48-hour staleness guard rejects scans older than 2 days — re-run the scan if needed.
 
-Generates ready-to-deploy templates:
-- **Tag Policy** — enforce allowed values across the Organization
-- **SCP** — deny resource creation without required tags
-- **EventBridge rule** — auto-tag new resources at creation
+### Enforce (Auto-generated)
+
+Each scan automatically generates three enforcement templates in S3 at `{run_id}/enforcement.json` — no manual trigger needed:
+
+| Artifact | Purpose | Deploy via |
+|----------|---------|-----------|
+| **Tag Policy** | Enforce allowed values across the Organization | Organizations → Tag policies |
+| **SCP** | Deny resource creation without required tags | Organizations → SCPs (**test in sandbox OU first**) |
+| **EventBridge rule** | Auto-tag new resources with `Owner` from CloudTrail creator identity | EventBridge + Lambda target |
+
+These are ready-to-deploy templates — not applied automatically. Review and deploy through your standard change management process.
+
+```bash
+# Retrieve enforcement artifacts from your latest scan
+aws s3 cp s3://tagsense-results-$(aws sts get-caller-identity --query Account --output text)/tagsense/<run_id>/enforcement.json .
+```
+
+The generated SCP covers common resource creation actions (`RunInstances`, `CreateDBInstance`, `CreateBucket`, `CreateFunction`, `CreateTable`) and uses `aws:RequestTag` conditions to deny creation when required tags are missing. Extend the `Action` list in the template to cover additional resource types relevant to your organization.
 
 ## Customization
 
@@ -276,7 +327,7 @@ TagSense can integrate with your existing AWS Config [`required-tags`](https://d
 Set the `ConfigRuleName` parameter when deploying:
 
 ```bash
-sam deploy --guided \
+sam deploy --guided --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides ConfigRuleName=required-tags
 ```
 
@@ -289,7 +340,7 @@ Config-aware mode is optional and backwards-compatible — if `ConfigRuleName` i
 
 ## Cost
 
-~$1-5 per account scan. Bedrock Batch (Claude Sonnet 4.6) is 50% cheaper than real-time invocation when available (requires ≥100 resources for Tier 4). For smaller accounts or when batch is unavailable, the pipeline automatically falls back to real-time parallel invocation (~$0.006/resource). Extended thinking retry adds ~$0.36 per scan for the ~5-10% of resources that need deeper reasoning — total cost remains under $7 for a typical 2,000-resource account.
+Approximately $1-5 per account scan. Bedrock Batch (Claude Sonnet 4.6) is 50% cheaper than real-time invocation when available (requires ≥100 resources for Tier 4). For smaller accounts or when batch is unavailable, the pipeline automatically falls back to real-time parallel invocation at approximately $0.006/resource. Extended thinking retry adds approximately $0.36 per scan for the 5-10% of resources that need deeper reasoning — total cost remains under $7 for a typical 2,000-resource account.
 
 ## Extended Thinking (Automatic)
 
@@ -471,6 +522,12 @@ This removes: all Lambda functions, Step Functions state machine, IAM roles, S3 
 - **aws: prefix protection** — Never writes AWS-managed tag keys
 - **Audit trail** — Every apply action logged to S3 with full before/after state
 - **DLQ** — Failed inferences captured for retry without data loss
+
+## Related Reading
+
+- [Best Practices for Tagging AWS Resources](https://docs.aws.amazon.com/whitepapers/latest/tagging-best-practices/tagging-best-practices.html) — AWS whitepaper on tagging strategy design
+- [Tag policies](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_tag-policies.html) — AWS Organizations tag policy documentation
+- [Why Your AWS Tagging Strategy Is Failing (And How to Fix It)](https://amnic.com/blogs/aws-tagging) — Industry analysis of tagging challenges; TagSense addresses the retroactive remediation gap identified in this article
 
 ## License
 

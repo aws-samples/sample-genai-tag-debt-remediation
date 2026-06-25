@@ -601,7 +601,7 @@ def handler(event, context):
             inf.get("method", "N/A"),
             evidence,
             "YES" if inf.get("is_likely_orphan") else "",
-            "",  # Approve column — left blank for reviewer
+            "Y" if inf.get("tier") in (1, 2) and inf.get("suggested_tags") else "N",
         ])
 
     csv_key = f"{RESULTS_PREFIX}/{run_id}/review.csv"
@@ -633,36 +633,63 @@ def handler(event, context):
         else 0
     )
 
-    summary_text = f"""=== TagSense Report ===
-Run: {run_id} | Region: {region} | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+    # Calculate quick wins
+    quick_wins = tier_counts.get(1, 0) + tier_counts.get(2, 0)
+    ai_suggestions = tier_counts.get(4, 0)
+    total_suggestions = quick_wins + tier_counts.get(3, 0) + ai_suggestions
 
-DISCOVERY
-  Total resources: {summary_stats['total_resources']}
-  Compliant: {summary_stats['compliant']} ({summary_stats['compliance_pct']}%)
-  Non-compliant: {summary_stats['non_compliant']}
-  IaC managed: {summary_stats.get('iac_managed', 'N/A')} ({summary_stats.get('iac_coverage_pct', 'N/A')}%)
-  Unmanaged (non-IaC): {summary_stats.get('iac_unmanaged', 'N/A')}
+    summary_text = f"""TagSense Scan Complete ✓
+{'='*50}
+Run ID: {run_id} | {datetime.now(timezone.utc).strftime('%B %d, %Y at %H:%M UTC')} | Region: {region}
 
-INFERENCE (Distributed Map + Bedrock Batch)
-  Tier 1 (CloudFormation):  {tier_counts.get(1, 0)} resources (~99% confidence)
-  Tier 2 (CloudTrail):      {tier_counts.get(2, 0)} resources (~95% confidence)
-  Tier 3 (Neighbor):        {tier_counts.get(3, 0)} resources (~80% confidence)
-  Tier 4 (Bedrock AI):      {tier_counts.get(4, 0)} resources (~60% confidence)
-  Tier 5 (Manual):          {tier_counts.get(5, 0)} resources (needs human review)
-  Orphan candidates:        {orphan_count}
-{f'  ⚠ WARNING: {bedrock_warning}' if bedrock_warning else ''}
-PROJECTED COMPLIANCE: {summary_stats['compliance_pct']}% → ~{projected_pct}%
+Hi — here's what TagSense found in your account:
 
-NEXT STEPS
-  1. Download review CSV: aws s3 cp s3://{RESULTS_BUCKET}/{csv_key} ./review.csv
-  2. Open in Excel/Google Sheets
-  3. Filter by Tier (1-4) to see resources with suggestions
-  4. Mark "Y" in Approve column for suggestions you accept
-  5. Re-upload and trigger Apply Lambda (dry-run first)
+📊 YOUR ACCOUNT AT A GLANCE
+   {summary_stats['total_resources']} total resources scanned
+   {summary_stats['compliant']} already compliant ({summary_stats['compliance_pct']}%)
+   {summary_stats['non_compliant']} need tagging attention
+   {summary_stats.get('iac_managed', 0)} managed by IaC ({summary_stats.get('iac_coverage_pct', 0)}% coverage)
 
-FILES
-  Review CSV: s3://{RESULTS_BUCKET}/{csv_key}
-  Full data:  s3://{RESULTS_BUCKET}/{RESULTS_PREFIX}/{run_id}/inference.json
+🏷️  WHAT TAGSENSE RECOMMENDS
+   TagSense analyzed your {summary_stats['non_compliant']} non-compliant resources and produced
+   {total_suggestions} tag suggestions across {sum(1 for t in [1,2,3,4] if tier_counts.get(t,0) > 0)} confidence tiers:
+
+   ✅ {quick_wins} high-confidence (Tier 1-2) — safe to apply immediately
+      These come from CloudFormation stack tags and CloudTrail creator attribution.
+
+   🔶 {tier_counts.get(3, 0)} medium-confidence (Tier 3) — from VPC neighbor consensus
+      Verify these make sense for the specific resource before applying.
+
+   🤖 {ai_suggestions} AI-inferred (Tier 4) — Bedrock suggestions with evidence
+      Review the reasoning in the CSV before approving.
+
+   ✋ {tier_counts.get(5, 0)} need human review (Tier 5) — insufficient signal for automation
+      These resources lack enough context for TagSense to suggest values.
+
+   🗑️  {orphan_count} orphan candidate(s) — no recent activity or owner signals
+{f'   ⚠️  {bedrock_warning}' if bedrock_warning else ''}
+
+📈 PROJECTED IMPACT
+   If you approve all suggestions, compliance improves from {summary_stats["compliance_pct"]}% → {projected_pct}%
+
+🚀 WHAT TO DO NEXT
+   1. Review the HTML report (visual dashboard):
+      aws s3 cp s3://{RESULTS_BUCKET}/{RESULTS_PREFIX}/{run_id}/report.html ./report.html
+      open report.html
+
+   2. Download the review CSV:
+      aws s3 cp s3://{RESULTS_BUCKET}/{csv_key} ./review.csv
+
+   3. Open in Excel/Sheets → filter by Tier → mark "Y" in Approve column
+
+   4. Apply approved tags (dry-run first):
+      aws lambda invoke --function-name tagsense-apply \\
+        --payload '{{"run_id": "{run_id}", "dry_run": true}}' response.json
+
+📁 FILES
+   HTML Report: s3://{RESULTS_BUCKET}/{RESULTS_PREFIX}/{run_id}/report.html
+   Review CSV:  s3://{RESULTS_BUCKET}/{csv_key}
+   Raw data:    s3://{RESULTS_BUCKET}/{RESULTS_PREFIX}/{run_id}/inference.json
 """
 
     # Save summary
@@ -719,4 +746,16 @@ FILES
 
     logger.info("Report generated: csv=%s, projected_compliance=%.1f%%", csv_key, projected_pct)
 
-    return {"run_id": run_id, "csv_key": csv_key, "summary": summary_text}
+    # Print output locations for CLI users
+    output_msg = (
+        f"\n{'='*50}\n"
+        f"✅ TagSense scan complete — {run_id}\n"
+        f"{'='*50}\n"
+        f"\nOutputs ready:\n"
+        f"  📄 HTML Report:  aws s3 cp s3://{RESULTS_BUCKET}/{RESULTS_PREFIX}/{run_id}/report.html ./report.html && open report.html\n"
+        f"  📋 Review CSV:   aws s3 cp s3://{RESULTS_BUCKET}/{csv_key} ./review.csv\n"
+        f"  📝 Summary:      aws s3 cp s3://{RESULTS_BUCKET}/{RESULTS_PREFIX}/{run_id}/summary.txt - --region {region}\n"
+    )
+    logger.info(output_msg)
+
+    return {"run_id": run_id, "csv_key": csv_key, "summary": summary_text, "output_message": output_msg}

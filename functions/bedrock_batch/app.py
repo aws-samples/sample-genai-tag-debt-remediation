@@ -6,22 +6,52 @@ from datetime import datetime, timezone
 from config import load_tag_policy, REGION, RESULTS_BUCKET, RESULTS_PREFIX, BEDROCK_MODEL_ID, BEDROCK_BATCH_MODEL_ID, BEDROCK_CONFIDENCE_THRESHOLD
 
 
-def build_prompt(resource, tag_policy):
+def _load_org_context(s3_client):
+    """Load org-context.json from S3 if available."""
+    try:
+        obj = s3_client.get_object(
+            Bucket=RESULTS_BUCKET,
+            Key=f"{RESULTS_PREFIX}/context/org-context.json"
+        )
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return None
+
+
+def build_prompt(resource, tag_policy, org_context=None):
     existing = resource.get("tags", {})
     missing = resource.get("missing_tags", [])
+
+    # Build org-context steering section
+    steering = ""
+    if org_context:
+        if org_context.get("environments"):
+            steering += f"\nValid Environment values: {json.dumps(org_context['environments'])}"
+        if org_context.get("cost_centers"):
+            steering += f"\nValid CostCenter values: {json.dumps(list(org_context['cost_centers'].keys()))}"
+        if org_context.get("applications"):
+            steering += f"\nValid Application values: {json.dumps(org_context['applications'])}"
+        if org_context.get("teams"):
+            steering += f"\nValid Owner/Team values: {json.dumps(list(org_context['teams'].keys()))}"
+        if org_context.get("naming_conventions"):
+            steering += f"\nNaming conventions: {json.dumps(org_context['naming_conventions'])}"
+        if steering:
+            steering = f"\n\nOrganization context (CONSTRAIN your suggestions to these valid values when possible):{steering}"
+
     return f"""You are an AWS resource tagging assistant. Suggest tags for this resource.
 
 Resource: ARN={resource['arn']}, Type={resource['resource_type']}
 Existing tags: {json.dumps(existing)}
 
 Required tags (suggest values for THESE missing ones only): {json.dumps({k:v for k,v in tag_policy.items() if k in missing})}
-
+{steering}
 Rules:
 - Use existing tags, resource name, and ARN to infer required tags.
 - For Owner: look at creator, creatorUserId, lambda:createdBy tags.
 - For Environment: look at Name patterns (prod, dev, staging).
 - For Application: look at Name, AmazonDataZoneProject, stack name patterns.
 - For CostCenter: only suggest if clear evidence. Otherwise say "unknown".
+- If org context provides valid values, ONLY suggest from those lists.
 - State confidence: high/medium/low per tag.
 - If you cannot determine a value, say "unknown".
 - Respond ONLY with JSON: {{"tags": {{"Key": {{"value":"...","confidence":"high|medium|low","reasoning":"..."}}}}}}"""
@@ -66,6 +96,9 @@ def handler(event, context):
     s3 = boto3.client("s3")
     bedrock = boto3.client("bedrock", region_name=region)
 
+    # Load org-context for value steering
+    org_context = _load_org_context(s3)
+
     # Determine input source — standard run or thinking retry
     if use_thinking:
         # Thinking retry: read low-confidence resources from previous run
@@ -95,7 +128,7 @@ def handler(event, context):
         model_input = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 500,
-            "messages": [{"role": "user", "content": build_prompt(resource, tag_policy)}]
+            "messages": [{"role": "user", "content": build_prompt(resource, tag_policy, org_context)}]
         }
         # Enable extended thinking for retry pass
         if use_thinking:
@@ -133,7 +166,7 @@ def handler(event, context):
                     body=json.dumps({
                         "anthropic_version": "bedrock-2023-05-31",
                         "max_tokens": 500,
-                        "messages": [{"role": "user", "content": build_prompt(resource, tag_policy)}],
+                        "messages": [{"role": "user", "content": build_prompt(resource, tag_policy, org_context)}],
                     })
                 )
                 text = json.loads(resp["body"].read())["content"][0]["text"]
@@ -193,7 +226,7 @@ def handler(event, context):
                     body=json.dumps({
                         "anthropic_version": "bedrock-2023-05-31",
                         "max_tokens": 500,
-                        "messages": [{"role": "user", "content": build_prompt(resource, tag_policy)}],
+                        "messages": [{"role": "user", "content": build_prompt(resource, tag_policy, org_context)}],
                     })
                 )
                 text = json.loads(resp["body"].read())["content"][0]["text"]
