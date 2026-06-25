@@ -355,6 +355,8 @@ Results from the thinking pass are tagged with `method: "Bedrock Batch AI (exten
 
 ## Reading the Report
 
+![TagSense Report Preview](report-preview.gif)
+
 Each scan produces three outputs in S3:
 
 | File | Purpose |
