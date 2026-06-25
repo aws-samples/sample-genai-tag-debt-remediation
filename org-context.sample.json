@@ -1,0 +1,26 @@
+{
+  "cost_centers": {
+    "CC-ENG-001": "Platform Engineering",
+    "CC-DATA-002": "Data & Analytics",
+    "CC-SEC-003": "Security & Compliance",
+    "CC-OPS-004": "Cloud Operations"
+  },
+  "environments": ["prod", "staging", "dev", "sandbox"],
+  "applications": [
+    "order-service",
+    "payment-gateway",
+    "data-lake",
+    "auth-platform",
+    "monitoring"
+  ],
+  "teams": {
+    "platform-eng": { "owner": "jsmith", "cost_center": "CC-ENG-001" },
+    "data-team": { "owner": "mjones", "cost_center": "CC-DATA-002" },
+    "security": { "owner": "klee", "cost_center": "CC-SEC-003" }
+  },
+  "naming_conventions": {
+    "account_alias_pattern": "{team}-{env}-{region}",
+    "resource_name_pattern": "{app}-{component}-{env}",
+    "examples": ["order-service-api-prod", "data-lake-etl-dev", "auth-platform-cognito-staging"]
+  }
+}
