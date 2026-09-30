@@ -82,6 +82,11 @@ def handler(event, context):
     s3 = boto3.client("s3")
     tagging = boto3.client("resourcegroupstaggingapi", region_name=region)
 
+    try:
+        own_account = boto3.client("sts").get_caller_identity()["Account"]
+    except Exception:
+        own_account = ""
+
     # Validate scan is not stale
     stale_error = _validate_scan_freshness(s3, run_id, max_age_hours)
     if stale_error:
@@ -94,7 +99,7 @@ def handler(event, context):
     )
     reader = csv.DictReader(io.StringIO(obj["Body"].read().decode("utf-8")))
 
-    applied, skipped, errors = [], [], []
+    applied, skipped, errors, cross_account = [], [], [], []
 
     for row in reader:
         arn = row.get("ARN", "").strip()
@@ -105,6 +110,19 @@ def handler(event, context):
         approval = row.get("Approve (Y/N)", "").strip().upper()
         if approval != "Y":
             skipped.append(arn)
+            continue
+
+        # Cross-account guard: this Lambda's tagging client can only write in its
+        # own account. Refuse rows whose Account differs (aggregator-discovered
+        # resources in other accounts). Enabling cross-account writes requires
+        # the optional AssumeRole extension documented in the README.
+        row_account = (row.get("Account") or "").strip()
+        if row_account and own_account and row_account != own_account:
+            logger.warning(
+                "Refusing cross-account tag write for %s (account %s != %s)",
+                arn, row_account, own_account,
+            )
+            cross_account.append({"arn": arn, "account": row_account})
             continue
 
         # Parse and validate suggested tags
@@ -140,10 +158,17 @@ def handler(event, context):
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "dry_run": dry_run,
+        "own_account": own_account,
         "applied": len(applied),
         "skipped": len(skipped),
         "errors": len(errors),
-        "details": {"applied": applied, "skipped": skipped, "errors": errors},
+        "cross_account_refused": len(cross_account),
+        "details": {
+            "applied": applied,
+            "skipped": skipped,
+            "errors": errors,
+            "cross_account_refused": cross_account,
+        },
     }
     audit_key = f"{RESULTS_PREFIX}/{run_id}/apply_audit.json"
     s3.put_object(
@@ -154,8 +179,8 @@ def handler(event, context):
     )
 
     logger.info(
-        "Apply complete: %d applied, %d skipped, %d errors (dry_run=%s)",
-        len(applied), len(skipped), len(errors), dry_run,
+        "Apply complete: %d applied, %d skipped, %d errors, %d cross-account refused (dry_run=%s)",
+        len(applied), len(skipped), len(errors), len(cross_account), dry_run,
     )
 
     return {
@@ -164,5 +189,6 @@ def handler(event, context):
         "applied": len(applied),
         "skipped": len(skipped),
         "errors": len(errors),
+        "cross_account_refused": len(cross_account),
         "audit_key": audit_key,
     }

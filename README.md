@@ -123,7 +123,8 @@ aws s3 cp s3://$BUCKET/tagsense/$RUN_ID/review.csv ./review.csv
 | `BedrockModelId` | `us.anthropic.claude-sonnet-4-6` | Primary model for AI inference |
 | `BedrockFallbackModelId` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Fallback on throttle |
 | `NotificationEmail` | *(empty)* | Email for scan completion + failure alerts |
-| `ConfigRuleName` | *(empty)* | AWS Config rule for policy-aware mode |
+| `ConfigRuleName` | *(empty)* | AWS Config rule **name or ARN** for Config-aware mode (an ARN is normalized to its name) |
+| `ConfigAggregatorName` | *(empty)* | AWS Config aggregator name for org-wide multi-account discovery (used with `ConfigRuleName`) |
 | `ScheduleExpression` | `rate(7 days)` | Automated scan frequency |
 | `MaxResources` | `10000` | Resources processed per scan |
 | `MaxBedrockCalls` | `500` | AI calls per scan (cost control) |
@@ -328,19 +329,54 @@ TagSense can integrate with your existing AWS Config [`required-tags`](https://d
 
 ### Enable Config-Aware Mode
 
-Set the `ConfigRuleName` parameter when deploying:
+Set the `ConfigRuleName` parameter (a rule **name** or **ARN** — an ARN is normalized to its name automatically) when deploying:
 
 ```bash
+# By rule name
 sam deploy --guided --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides ConfigRuleName=required-tags
+
+# By rule ARN (equivalent — normalized to the name internally)
+sam deploy --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides ConfigRuleName=arn:aws:config:us-east-1:123456789012:config-rule/config-rule-abc123
 ```
 
-| Mode | Discovery Source | Tag Policy Source |
-|------|-----------------|-------------------|
-| Default (no Config) | Scans all taggable resources | `TAG_POLICY` env var or built-in defaults |
-| Config-aware | Only non-compliant resources from Config rule | Config rule parameters (keys + allowed values) |
+For org-wide (multi-account) discovery, also set `ConfigAggregatorName`:
+
+```bash
+sam deploy --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides ConfigRuleName=required-tags ConfigAggregatorName=my-org-aggregator
+```
+
+| Mode | Trigger | Discovery Source | Tag Policy Source |
+|------|---------|-----------------|-------------------|
+| Default (full scan) | neither param set | Scans all taggable resources in the account | `TAG_POLICY` env var, Organizations tag policy, or built-in defaults |
+| Config-aware (single-account) | `ConfigRuleName` set | Only that rule's NON_COMPLIANT resources in this account (`GetComplianceDetailsByConfigRule` → ARN via `BatchGetResourceConfig`) | Config rule `required-tags` parameters (keys + allowed values) |
+| Config aggregator (multi-account) | `ConfigRuleName` + `ConfigAggregatorName` | NON_COMPLIANT resources across **all aggregated accounts/regions** (`GetAggregateComplianceDetailsByConfigRule` → ARN via `SelectAggregateResourceConfig`) | Org config rule parameters (`DescribeOrganizationConfigRules`), falling back to the local rule |
 
 Config-aware mode is optional and backwards-compatible — if `ConfigRuleName` is empty, TagSense behaves exactly as before.
+
+**Why name-or-ARN (and not ARN-only):** every AWS Config compliance/describe API used here is keyed on the rule **name** (`[A-Za-z0-9_-]+`), not the ARN. TagSense accepts an ARN for convenience and parses the trailing `config-rule/<name>` segment. Building an ARN from a name is *not* reliable (Config appends a generated id), so discovery always resolves the authoritative ARN from Config itself (`BatchGetResourceConfig` / `SelectAggregateResourceConfig`) and only falls back to a deterministic per-type ARN template when Config doesn't return one.
+
+### Multi-account caveats (aggregator mode)
+
+The aggregator makes **discovery and reporting** org-wide, but v1's downstream stages run with the deployed Lambda's own execution role, which is single-account. So for resources discovered in **other** accounts:
+
+- **Tier 1 (CloudFormation stack tags)** — only matches stacks in the deployment account.
+- **Tier 2 (CloudTrail creator) and Tier 3 (VPC neighbor consensus)** — **skipped**; those resources route straight to Tier 4 (AI, using Config metadata only) or Tier 5 (manual). The report/CSV marks them cross-account.
+- **Apply** — refuses cross-account tag writes (the `Account` column in the CSV ≠ the deployment account); such rows are logged as `cross_account_refused` in the apply audit and are never auto-approved.
+
+This is intentional and honest: aggregator mode gives you a single org-wide tag-debt report without silently under-delivering enrichment/remediation. To lift these limits, see the next section.
+
+### Extending to cross-account enrichment / remediation
+
+To enrich (Tier 2/3) or remediate (Apply) resources in **member accounts**, add one of the following cross-account patterns. These are intentionally out of scope for v1 (they need additional roles/infrastructure), but the code carries `account_id` + `region` on every resource so they can be layered in:
+
+- **CloudTrail Lake (org event data store)** — makes **Tier 2** cross-account without assuming roles. Replace the per-account `cloudtrail:LookupEvents` call with a CloudTrail Lake `StartQuery`/`GetQueryResults` SQL query against an organization event data store, filtering on the resource's account. (An organization *trail* alone does **not** do this — it centralizes log delivery to S3, not the query API. You need a CloudTrail Lake event data store.)
+- **IAM cross-account roles** — the general pattern for Tier 3 and Apply. Create a role in each target account trusting the central account; the central Lambda calls `sts:AssumeRole` per target account and runs the Describe / `tag:TagResources` calls locally in that account.
+- **AWS Systems Manager (SSM) Quick Setup / Automation** — run automation documents or commands centrally across multiple accounts and OUs (an alternative to hand-rolled AssumeRole fan-out).
+- **AWS Config Aggregators** — already used here for discovery; collects resource configuration and state metadata from all org accounts into one central account, avoiding direct per-account API throttling.
+- **AWS Resource Explorer** — turn on with organization trusted access to search and discover resources across all member accounts from a central view (useful as an alternative discovery/ARN-resolution source for Tier 3 context).
 
 ## Cost
 
@@ -518,7 +554,7 @@ This removes: all Lambda functions, Step Functions state machine, IAM roles, S3 
 - Business context tags (Compliance, SLA) require human knowledge
 - Shared resources (NAT GW, TGW) flagged as ambiguous
 - Max 50 user tags per resource — checked before recommending
-- Single-account scope (multi-account via Config aggregator on roadmap)
+- Multi-account discovery/reporting supported via Config aggregator (`ConfigAggregatorName`); cross-account **enrichment (Tier 2/3) and remediation (Apply)** need an added cross-account pattern (see "Extending to cross-account enrichment / remediation")
 
 ## Security
 

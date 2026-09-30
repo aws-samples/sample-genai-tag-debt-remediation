@@ -233,35 +233,78 @@ def check_orphan(resource: dict, cw) -> bool:
         return False
 
 
+def _reject_disallowed_values(suggested: dict, tag_policy: dict) -> dict:
+    """Drop suggested values that violate a tag policy's allowed_values.
+
+    When the (Config-sourced or Org) tag policy constrains a key to a set of
+    allowed values, any suggestion outside that set is removed before it can be
+    surfaced for approval — this makes Tier 3/4 honor the same allow-list the
+    Config rule enforces, achieving 100% validity on constrained tags.
+    """
+    if not suggested:
+        return suggested
+    cleaned = {}
+    for k, v in suggested.items():
+        allowed = tag_policy.get(k, {}).get("allowed_values")
+        if allowed and v not in allowed:
+            logger.debug("Rejecting %s=%s (not in allowed_values %s)", k, v, allowed)
+            continue
+        cleaned[k] = v
+    return cleaned
+
+
 def process_resource(resource: dict, tag_policy: dict, clients: dict) -> dict:
-    """Run Tiers 1-3 on a single resource. Flag for Tier 4/5 if unresolved."""
+    """Run Tiers 1-3 on a single resource. Flag for Tier 4/5 if unresolved.
+
+    Cross-account resources (discovered via a Config aggregator from a different
+    account than this deployment) cannot be enriched by Tier 2 (CloudTrail) or
+    Tier 3 (VPC neighbor) because those calls run against this Lambda's own
+    account only. For them we run Tier 1 (stack tags, if any local match) then
+    route straight to Tier 4/5. See README "Extending to cross-account
+    enrichment/remediation" for how to enable true cross-account inference.
+    """
     if not resource.get("missing_tags"):
         return {**resource, "inference": {"tier": 0, "method": "Already compliant",
                                           "suggested_tags": {}, "confidence": 100}}
 
     missing = resource["missing_tags"]
     start_tier = int(os.environ.get("START_FROM_TIER", "1"))
+    is_cross_account = bool(resource.get("cross_account"))
 
-    # Tier 1
-    if start_tier <= 1:
+    # Tier 1 (stack tags) — only meaningful for local resources.
+    if start_tier <= 1 and not is_cross_account:
         r = tier1_stack(resource)
-        if r and any(k in r.get("suggested_tags", {}) for k in missing):
-            return {**resource, "inference": r}
-
-    # Tier 2
-    if start_tier <= 2:
-        r = tier2_cloudtrail(resource, clients["trail"])
         if r:
-            return {**resource, "inference": r}
+            r["suggested_tags"] = _reject_disallowed_values(
+                r.get("suggested_tags", {}), tag_policy
+            )
+            if any(k in r.get("suggested_tags", {}) for k in missing):
+                return {**resource, "inference": r}
 
-    # Tier 3
-    if start_tier <= 3:
-        r = tier3_neighbor(resource, clients["ec2"], tag_policy)
-        if r and r["confidence"] >= 60:
-            return {**resource, "inference": r}
+    # Tiers 2 & 3 are single-account; skip entirely for cross-account resources.
+    if not is_cross_account:
+        # Tier 2
+        if start_tier <= 2:
+            r = tier2_cloudtrail(resource, clients["trail"])
+            if r:
+                r["suggested_tags"] = _reject_disallowed_values(
+                    r.get("suggested_tags", {}), tag_policy
+                )
+                if r["suggested_tags"]:
+                    return {**resource, "inference": r}
 
-    # Check orphan status
-    is_orphan = check_orphan(resource, clients["cw"])
+        # Tier 3
+        if start_tier <= 3:
+            r = tier3_neighbor(resource, clients["ec2"], tag_policy)
+            if r:
+                r["suggested_tags"] = _reject_disallowed_values(
+                    r.get("suggested_tags", {}), tag_policy
+                )
+                if r["suggested_tags"] and r["confidence"] >= 60:
+                    return {**resource, "inference": r}
+
+    # Orphan check is single-account too (CloudWatch metrics local only).
+    is_orphan = False if is_cross_account else check_orphan(resource, clients["cw"])
 
     # Determine if Tier 4 (Bedrock) should be attempted based on signal quality
     existing_tags = resource.get("tags", {})
@@ -271,6 +314,13 @@ def process_resource(resource: dict, tag_policy: dict, clients: dict) -> dict:
         len(existing_tags) >= 2
     )
 
+    if is_cross_account:
+        evidence = "Cross-account (aggregator): Tier 2/3 skipped — see README cross-account extension"
+    elif has_signal:
+        evidence = "Queued for AI inference"
+    else:
+        evidence = "No signal from Tiers 1-3"
+
     return {
         **resource,
         "inference": {
@@ -278,7 +328,8 @@ def process_resource(resource: dict, tag_policy: dict, clients: dict) -> dict:
             "method": "Pending Bedrock Batch" if has_signal else "Manual review",
             "suggested_tags": {},
             "confidence": 0,
-            "evidence": "Queued for AI inference" if has_signal else "No signal from Tiers 1-3",
+            "evidence": evidence,
+            "cross_account": is_cross_account,
             "is_likely_orphan": is_orphan,
             "orphan_note": f"No usage in {ORPHAN_INACTIVITY_DAYS} days — consider terminating" if is_orphan else "",
         },
