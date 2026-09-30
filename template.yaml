@@ -15,6 +15,7 @@ Globals:
         BEDROCK_FALLBACK_MODEL_ID: !Ref BedrockFallbackModelId
         SNS_TOPIC_ARN: !If [HasEmail, !Ref NotificationTopic, '']
         CONFIG_RULE_NAME: !Ref ConfigRuleName
+        CONFIG_AGGREGATOR_NAME: !Ref ConfigAggregatorName
         MAX_RESOURCES: !Ref MaxResources
         MAX_BEDROCK_CALLS: !Ref MaxBedrockCalls
         START_FROM_TIER: !Ref StartFromTier
@@ -34,7 +35,11 @@ Parameters:
   ConfigRuleName:
     Type: String
     Default: ''
-    Description: 'Optional: AWS Config rule name (e.g., required-tags) to use as policy source and non-compliant resource filter'
+    Description: 'Optional: AWS Config rule NAME or ARN (e.g., required-tags, or arn:aws:config:...:config-rule/config-rule-abc123). An ARN is normalized to its name. When set, TagSense uses the rule as the tag-policy source of truth and scopes discovery to that rule''s NON_COMPLIANT resources.'
+  ConfigAggregatorName:
+    Type: String
+    Default: ''
+    Description: 'Optional: AWS Config configuration aggregator name for org-wide (multi-account) discovery. Used together with ConfigRuleName. NOTE: Tier 2/3 inference and Apply are single-account in v1 — cross-account resources are reported but not enriched/remediated without the optional cross-account extensions (see README).'
   ScheduleExpression:
     Type: String
     Default: 'rate(1 day)'
@@ -157,8 +162,13 @@ Resources:
                   - ec2:DescribeSecurityGroups
                   - cloudwatch:GetMetricData
                   - config:DescribeConfigRules
+                  - config:DescribeOrganizationConfigRules
                   - config:GetComplianceDetailsByConfigRule
                   - config:DescribeComplianceByConfigRule
+                  - config:BatchGetResourceConfig
+                  - config:DescribeConfigurationAggregators
+                  - config:GetAggregateComplianceDetailsByConfigRule
+                  - config:SelectAggregateResourceConfig
                   - iam:ListAccountAliases
                   - sts:GetCallerIdentity
                   - organizations:DescribeEffectivePolicy

@@ -279,3 +279,198 @@ class TestTier1Stack:
         result = self._tier1(resource)
         assert result["suggested_tags"] == {"Owner": "team-b"}
         assert "Environment" not in result["suggested_tags"]
+
+
+# --- AWS Config rule identifier normalization (config.py::_config_rule_name) ---
+
+def _config_rule_name(value):
+    """Copied from config.py for isolated testing (no boto3)."""
+    if not value:
+        return ""
+    v = value.strip()
+    if v.startswith("arn:"):
+        marker = ":config-rule/"
+        idx = v.find(marker)
+        if idx != -1:
+            return v[idx + len(marker):]
+        return v.split("/")[-1].split(":")[-1]
+    return v
+
+
+class TestConfigRuleName:
+    def test_plain_name_unchanged(self):
+        assert _config_rule_name("required-tags") == "required-tags"
+
+    def test_full_arn_to_name(self):
+        arn = "arn:aws:config:us-east-1:663479261746:config-rule/config-rule-q7ecvv"
+        assert _config_rule_name(arn) == "config-rule-q7ecvv"
+
+    def test_empty(self):
+        assert _config_rule_name("") == ""
+
+    def test_whitespace_trimmed(self):
+        assert _config_rule_name("  required-tags  ") == "required-tags"
+
+    def test_arn_without_marker_falls_back(self):
+        # Degenerate ARN shape — fall back to last segment rather than crash.
+        assert _config_rule_name("arn:aws:config:us-east-1:123:weird/thing") == "thing"
+
+
+# --- required-tags InputParameters parsing (config.py) ---
+
+def _parse_required_tags_input_parameters(input_parameters):
+    """Copied from config.py for isolated testing."""
+    if not input_parameters:
+        return {}
+    try:
+        params = json.loads(input_parameters)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    policy = {}
+    for i in range(1, 7):
+        key = params.get(f"tag{i}Key")
+        if not key:
+            continue
+        entry = {"required": True}
+        raw_values = params.get(f"tag{i}Value")
+        if raw_values:
+            values = [v.strip() for v in str(raw_values).split(",") if v.strip()]
+            if values:
+                entry["allowed_values"] = values
+        policy[key] = entry
+    return policy
+
+
+class TestParseRequiredTagsInputParameters:
+    def test_keys_and_allowed_values(self):
+        params = json.dumps({
+            "tag1Key": "Environment", "tag1Value": "prod,staging,dev",
+            "tag2Key": "Owner",
+        })
+        policy = _parse_required_tags_input_parameters(params)
+        assert policy["Environment"] == {
+            "required": True, "allowed_values": ["prod", "staging", "dev"],
+        }
+        assert policy["Owner"] == {"required": True}
+
+    def test_empty_string(self):
+        assert _parse_required_tags_input_parameters("") == {}
+
+    def test_invalid_json(self):
+        assert _parse_required_tags_input_parameters("not json") == {}
+
+    def test_all_six_slots(self):
+        params = json.dumps({f"tag{i}Key": f"K{i}" for i in range(1, 7)})
+        policy = _parse_required_tags_input_parameters(params)
+        assert len(policy) == 6
+        assert all(policy[f"K{i}"]["required"] for i in range(1, 7))
+
+    def test_value_whitespace_stripped(self):
+        params = json.dumps({"tag1Key": "Env", "tag1Value": " prod , dev "})
+        policy = _parse_required_tags_input_parameters(params)
+        assert policy["Env"]["allowed_values"] == ["prod", "dev"]
+
+
+# --- Deterministic ARN construction (config.py::build_resource_arn) ---
+
+def build_resource_arn(resource_type, resource_id, region, account):
+    """Copied from config.py for isolated testing."""
+    if resource_id.startswith("arn:"):
+        return resource_id
+    kind = (resource_type or "").lower()
+    if "ec2::instance" in kind:
+        return f"arn:aws:ec2:{region}:{account}:instance/{resource_id}"
+    if "s3::bucket" in kind:
+        return f"arn:aws:s3:::{resource_id}"
+    if "lambda::function" in kind:
+        return f"arn:aws:lambda:{region}:{account}:function:{resource_id}"
+    if "rds::dbinstance" in kind:
+        return f"arn:aws:rds:{region}:{account}:db:{resource_id}"
+    if "rds::dbcluster" in kind:
+        return f"arn:aws:rds:{region}:{account}:cluster:{resource_id}"
+    if "dynamodb::table" in kind:
+        return f"arn:aws:dynamodb:{region}:{account}:table/{resource_id}"
+    if "elasticloadbalancingv2" in kind or "elasticloadbalancing::loadbalancer" in kind:
+        return f"arn:aws:elasticloadbalancing:{region}:{account}:loadbalancer/{resource_id}"
+    if "sns::topic" in kind:
+        return f"arn:aws:sns:{region}:{account}:{resource_id}"
+    if "sqs::queue" in kind:
+        return f"arn:aws:sqs:{region}:{account}:{resource_id}"
+    if "ecs::cluster" in kind:
+        return f"arn:aws:ecs:{region}:{account}:cluster/{resource_id}"
+    if "cloudfront::distribution" in kind:
+        return f"arn:aws:cloudfront::{account}:distribution/{resource_id}"
+    if "kinesis::stream" in kind:
+        return f"arn:aws:kinesis:{region}:{account}:stream/{resource_id}"
+    return resource_id
+
+
+class TestBuildResourceArn:
+    R, A = "us-east-1", "123456789012"
+
+    def test_ec2_instance(self):
+        assert build_resource_arn("AWS::EC2::Instance", "i-0abc", self.R, self.A) == \
+            "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc"
+
+    def test_s3_bucket_no_region_account(self):
+        assert build_resource_arn("AWS::S3::Bucket", "my-bucket", self.R, self.A) == \
+            "arn:aws:s3:::my-bucket"
+
+    def test_lambda_function(self):
+        assert build_resource_arn("AWS::Lambda::Function", "fn", self.R, self.A) == \
+            "arn:aws:lambda:us-east-1:123456789012:function:fn"
+
+    def test_dynamodb_table(self):
+        assert build_resource_arn("AWS::DynamoDB::Table", "t", self.R, self.A) == \
+            "arn:aws:dynamodb:us-east-1:123456789012:table/t"
+
+    def test_rds_instance_vs_cluster(self):
+        assert ":db:" in build_resource_arn("AWS::RDS::DBInstance", "d", self.R, self.A)
+        assert ":cluster:" in build_resource_arn("AWS::RDS::DBCluster", "c", self.R, self.A)
+
+    def test_already_arn_passthrough(self):
+        arn = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/x/y"
+        assert build_resource_arn("AWS::ElasticLoadBalancingV2::LoadBalancer", arn, self.R, self.A) == arn
+
+    def test_unknown_type_returns_id(self):
+        assert build_resource_arn("AWS::Weird::Thing", "raw-id", self.R, self.A) == "raw-id"
+
+
+# --- Allowed-value rejection (inference_worker.py::_reject_disallowed_values) ---
+
+def _reject_disallowed_values(suggested, tag_policy):
+    """Copied from inference_worker/app.py for isolated testing."""
+    if not suggested:
+        return suggested
+    cleaned = {}
+    for k, v in suggested.items():
+        allowed = tag_policy.get(k, {}).get("allowed_values")
+        if allowed and v not in allowed:
+            continue
+        cleaned[k] = v
+    return cleaned
+
+
+class TestRejectDisallowedValues:
+    POLICY = {
+        "Environment": {"required": True, "allowed_values": ["prod", "dev"]},
+        "Owner": {"required": True},  # no allowed_values → unconstrained
+    }
+
+    def test_valid_value_kept(self):
+        assert _reject_disallowed_values({"Environment": "prod"}, self.POLICY) == {"Environment": "prod"}
+
+    def test_invalid_value_dropped(self):
+        assert _reject_disallowed_values({"Environment": "production"}, self.POLICY) == {}
+
+    def test_unconstrained_key_always_kept(self):
+        assert _reject_disallowed_values({"Owner": "anyone"}, self.POLICY) == {"Owner": "anyone"}
+
+    def test_mixed(self):
+        result = _reject_disallowed_values(
+            {"Environment": "staging", "Owner": "team-a"}, self.POLICY
+        )
+        assert result == {"Owner": "team-a"}  # staging not allowed, Owner kept
+
+    def test_empty(self):
+        assert _reject_disallowed_values({}, self.POLICY) == {}

@@ -22,7 +22,17 @@ import logging
 import boto3
 from datetime import datetime, timezone
 
-from config import load_tag_policy, REGION, RESULTS_BUCKET, RESULTS_PREFIX
+from config import (
+    load_tag_policy,
+    REGION,
+    RESULTS_BUCKET,
+    RESULTS_PREFIX,
+    CONFIG_RULE_NAME,
+    CONFIG_AGGREGATOR_NAME,
+    get_noncompliant_resources,
+    resolve_arns,
+    _config_rule_name,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -103,23 +113,12 @@ def _build_stack_map(cfn) -> dict:
     return stack_map
 
 
-def handler(event, context):
-    """Lambda entry point for resource discovery  and compliance scoring."""
-    region = event.get("region", REGION)
-    run_id = event.get("run_id", datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
-    tag_policy = load_tag_policy()
-    required_keys = [k for k, v in tag_policy.items() if v.get("required")]
+def _scan_all_resources(tagging, stack_map: dict) -> list:
+    """Full-scan mode (default): enumerate every taggable resource in the account.
 
-    logger.info("Starting discovery: run_id=%s, region=%s", run_id, region)
-
-    tagging = boto3.client("resourcegroupstaggingapi", region_name=region)
-    cfn = boto3.client("cloudformation", region_name=region)
-    s3 = boto3.client("s3")
-
-    # Phase 1: Build IaC classification map (Dataset A)
-    stack_map = _build_stack_map(cfn)
-
-    # Phase 2: Enumerate all taggable resources (Dataset B)
+    Returns a list of raw resource entries {arn, tags, account_id, region,
+    [managed_by, stack_tags]}.
+    """
     resources_raw = []
     paginator = tagging.get_paginator("get_resources")
     for page in paginator.paginate():
@@ -130,7 +129,6 @@ def handler(event, context):
                 for t in resource.get("Tags", [])
                 if not t["Key"].startswith("aws:")
             }
-            # IaC classification: check if resource is in any stack
             resource_id = arn.split("/")[-1] if "/" in arn else arn.split(":")[-1]
             stack_info = stack_map.get(arn) or stack_map.get(resource_id)
             entry = {"arn": arn, "tags": tags}
@@ -138,11 +136,97 @@ def handler(event, context):
                 entry["managed_by"] = stack_info["stack_name"]
                 entry["stack_tags"] = stack_info["tags"]
             resources_raw.append(entry)
+    return resources_raw
 
-    # Auto-discover tag policy if using hardcoded default and no explicit override
+
+def _scan_from_config(region: str, stack_map: dict, own_account: str) -> list:
+    """Config-aware mode: scope discovery to the rule's NON_COMPLIANT resources.
+
+    Uses the Config rule (single-account) or Config aggregator (multi-account)
+    to enumerate only non-compliant resources, resolves each to a taggable ARN,
+    and returns raw entries carrying account_id + region. Existing tags are not
+    fetched from Config here — downstream tiers/report read tags per-resource;
+    entries start with empty tags and rely on missing_tags from the policy eval.
+    """
+    noncompliant = get_noncompliant_resources(
+        CONFIG_RULE_NAME, region, CONFIG_AGGREGATOR_NAME or None
+    )
+    noncompliant = resolve_arns(
+        noncompliant, region, CONFIG_AGGREGATOR_NAME or None
+    )
+    resources_raw = []
+    for item in noncompliant:
+        arn = item.get("arn", "")
+        if not arn:
+            continue
+        acct = item.get("account_id", own_account)
+        entry = {
+            "arn": arn,
+            "tags": {},
+            "account_id": acct,
+            "region": item.get("region", region),
+            "config_resource_type": item.get("resource_type", ""),
+            # A resource flagged NON_COMPLIANT in a different account can't be
+            # enriched (Tier 2/3) or tagged by this single-account deployment.
+            "cross_account": bool(own_account) and acct != own_account,
+        }
+        resource_id = arn.split("/")[-1] if "/" in arn else arn.split(":")[-1]
+        stack_info = stack_map.get(arn) or stack_map.get(resource_id)
+        if stack_info:
+            entry["managed_by"] = stack_info["stack_name"]
+            entry["stack_tags"] = stack_info["tags"]
+        resources_raw.append(entry)
+    return resources_raw
+
+
+def handler(event, context):
+    """Lambda entry point for resource discovery and compliance scoring."""
+    region = event.get("region", REGION)
+    run_id = event.get("run_id", datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+    tag_policy = load_tag_policy()
+    required_keys = [k for k, v in tag_policy.items() if v.get("required")]
+
+    # Determine discovery mode from Config parameters.
+    if CONFIG_RULE_NAME and CONFIG_AGGREGATOR_NAME:
+        mode = "config-aggregator"
+    elif CONFIG_RULE_NAME:
+        mode = "config-rule"
+    else:
+        mode = "full-scan"
+
+    logger.info(
+        "Starting discovery: run_id=%s, region=%s, mode=%s", run_id, region, mode
+    )
+
+    tagging = boto3.client("resourcegroupstaggingapi", region_name=region)
+    cfn = boto3.client("cloudformation", region_name=region)
+    s3 = boto3.client("s3")
+
+    try:
+        own_account = boto3.client("sts").get_caller_identity()["Account"]
+    except Exception:
+        own_account = ""
+
+    # Phase 1: Build IaC classification map (local account only).
+    stack_map = _build_stack_map(cfn)
+
+    # Phase 2: Enumerate resources per mode.
+    if mode == "full-scan":
+        resources_raw = _scan_all_resources(tagging, stack_map)
+    else:
+        resources_raw = _scan_from_config(region, stack_map, own_account)
+
+    # Default region/account for entries produced by full-scan (local account).
+    for r in resources_raw:
+        r.setdefault("account_id", own_account)
+        r.setdefault("region", region)
+
+    # Auto-discover tag policy only in full-scan mode with the hardcoded default.
+    # When a Config rule (or explicit TAG_POLICY / Org policy) is the source of
+    # truth, we must NOT override it with frequency heuristics.
     from config import DEFAULT_TAG_POLICY
     policy_is_default = (tag_policy == DEFAULT_TAG_POLICY)
-    if policy_is_default and resources_raw:
+    if mode == "full-scan" and policy_is_default and resources_raw:
         from collections import Counter
         # Prefixes that indicate service-managed tags (not governance tags)
         SYSTEM_TAG_PREFIXES = (
@@ -173,12 +257,21 @@ def handler(event, context):
     resources = []
     for r in resources_raw:
         evaluated = _evaluate_resource(r["arn"], r["tags"], tag_policy, required_keys)
+        # Carry account/region and cross-account flag through to downstream tiers.
+        evaluated["account_id"] = r.get("account_id", own_account)
+        evaluated["region"] = r.get("region", region)
+        if r.get("cross_account"):
+            evaluated["cross_account"] = True
+        if r.get("config_resource_type"):
+            evaluated["config_resource_type"] = r["config_resource_type"]
         if r.get("managed_by"):
             evaluated["managed_by"] = r["managed_by"]
             evaluated["stack_tags"] = r["stack_tags"]
         resources.append(evaluated)
 
-    # Compute compliance summary
+    # In Config-aware mode every returned resource is already NON_COMPLIANT per
+    # the rule; treat them as non-compliant even if our local policy eval (with
+    # empty tags) would agree anyway. In full-scan mode use our own evaluation.
     total = len(resources)
     compliant_count = sum(1 for r in resources if r["compliant"])
     non_compliant = [r for r in resources if not r["compliant"]]
@@ -195,6 +288,9 @@ def handler(event, context):
     managed_count = sum(1 for r in resources if r.get("managed_by"))
     unmanaged_count = total - managed_count
 
+    # Cross-account visibility (aggregator mode).
+    cross_account_count = sum(1 for r in resources if r.get("cross_account"))
+
     summary = {
         "total_resources": total,
         "compliant": compliant_count,
@@ -204,11 +300,15 @@ def handler(event, context):
         "iac_unmanaged": unmanaged_count,
         "iac_coverage_pct": round(managed_count / total * 100, 1) if total else 0,
         "by_resource_type": by_type,
+        "discovery_mode": mode,
+        "config_rule": _config_rule_name(CONFIG_RULE_NAME) if CONFIG_RULE_NAME else None,
+        "config_aggregator": CONFIG_AGGREGATOR_NAME or None,
+        "cross_account_resources": cross_account_count,
     }
 
     logger.info(
-        "Discovery complete: %d resources, %d compliant (%.1f%%)",
-        total, compliant_count, summary["compliance_pct"],
+        "Discovery complete: mode=%s, %d resources, %d compliant (%.1f%%), %d cross-account",
+        mode, total, compliant_count, summary["compliance_pct"], cross_account_count,
     )
 
     # Write non-compliant resources as JSONL for Step Functions Distributed Map
@@ -239,6 +339,7 @@ def handler(event, context):
     return {
         "run_id": run_id,
         "region": region,
+        "mode": mode,
         "summary": summary,
         "non_compliant_count": len(non_compliant),
         "items_s3": {"Bucket": RESULTS_BUCKET, "Key": items_key},

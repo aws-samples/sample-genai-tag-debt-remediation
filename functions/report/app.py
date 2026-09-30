@@ -44,6 +44,8 @@ def _build_json_data(recommendations):
         tags_str = ",".join(f"{k}: {v}" for k, v in suggested.items()) if suggested else ""
         items.append({
             "arn": r.get("arn", ""),
+            "account": r.get("account_id", ""),
+            "region": r.get("region", ""),
             "type": r.get("resource_type", ""),
             "tier": inf.get("tier", 5),
             "conf": inf.get("confidence", 0),
@@ -577,7 +579,7 @@ def handler(event, context):
     csv_buffer = io.StringIO()
     writer = csv.writer(csv_buffer)
     writer.writerow([
-        "ARN", "Resource Type", "Existing Tags", "Missing Tags",
+        "ARN", "Account", "Region", "Resource Type", "Existing Tags", "Missing Tags",
         "Suggested Tags", "Confidence %", "Tier", "Method",
         "Evidence", "Likely Orphan", "Approve (Y/N)",
     ])
@@ -592,6 +594,8 @@ def handler(event, context):
 
         writer.writerow([
             rec["arn"],
+            rec.get("account_id", ""),
+            rec.get("region", ""),
             rec["resource_type"],
             json.dumps(rec.get("tags", {})),
             ", ".join(rec.get("missing_tags", [])),
@@ -601,7 +605,9 @@ def handler(event, context):
             inf.get("method", "N/A"),
             evidence,
             "YES" if inf.get("is_likely_orphan") else "",
-            "Y" if inf.get("tier") in (1, 2) and inf.get("suggested_tags") else "N",
+            # Do not pre-approve cross-account rows: Apply refuses them anyway.
+            "Y" if (inf.get("tier") in (1, 2) and inf.get("suggested_tags")
+                    and not inf.get("cross_account")) else "N",
         ])
 
     csv_key = f"{RESULTS_PREFIX}/{run_id}/review.csv"
