@@ -356,8 +356,6 @@ sam deploy --capabilities CAPABILITY_NAMED_IAM \
 
 Config-aware mode is optional and backwards-compatible — if `ConfigRuleName` is empty, TagSense behaves exactly as before.
 
-**Why name-or-ARN (and not ARN-only):** every AWS Config compliance/describe API used here is keyed on the rule **name** (`[A-Za-z0-9_-]+`), not the ARN. TagSense accepts an ARN for convenience and parses the trailing `config-rule/<name>` segment. Building an ARN from a name is *not* reliable (Config appends a generated id), so discovery always resolves the authoritative ARN from Config itself (`BatchGetResourceConfig` / `SelectAggregateResourceConfig`) and only falls back to a deterministic per-type ARN template when Config doesn't return one.
-
 ### Multi-account caveats (aggregator mode)
 
 The aggregator makes **discovery and reporting** org-wide, but v1's downstream stages run with the deployed Lambda's own execution role, which is single-account. So for resources discovered in **other** accounts:
